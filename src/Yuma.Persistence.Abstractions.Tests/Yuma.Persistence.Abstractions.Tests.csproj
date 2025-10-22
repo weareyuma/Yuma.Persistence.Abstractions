@@ -8,6 +8,10 @@
    </PropertyGroup>
 
    <ItemGroup>
+      <InternalsVisibleTo Include="DynamicProxyGenAssembly2"/>
+   </ItemGroup>
+
+   <ItemGroup>
       <ProjectReference Include="..\Yuma.Persistence.Abstractions\Yuma.Persistence.Abstractions.csproj"/>
    </ItemGroup>
 
