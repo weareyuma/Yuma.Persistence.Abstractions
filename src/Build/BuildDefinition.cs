@@ -1,0 +1,270 @@
+#region Copyright & License
+
+// Copyright © 2024 - 2025 Yuma
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#endregion
+
+using System;
+using System.IO;
+using System.Linq;
+using System.Net.Mime;
+using JetBrains.Annotations;
+using NuGet.Configuration;
+using Nuke.Common.CI.GitHubActions;
+using Nuke.Common.Git;
+using Nuke.Common.IO;
+using Nuke.Common.ProjectModel;
+using Nuke.Common.Tools.DotNet;
+using Nuke.Common.Tools.GitHub;
+using Nuke.Common.Tools.GitVersion;
+using Nuke.Common.Tools.ReportGenerator;
+using Nuke.Common.Utilities;
+using Nuke.Common.Utilities.Collections;
+using Octokit;
+using static Nuke.Common.Tools.DotNet.DotNetTasks;
+using static Serilog.Log;
+
+namespace build;
+
+[GitHubActions(
+	"ContinuousDelivery",
+	GitHubActionsImage.UbuntuLatest,
+	FetchDepth = 0,
+	OnPushBranches = ["main", "feature/*"],
+	// OnPullRequestBranches = ["main"],
+	InvokedTargets = [nameof(CI)],
+	PublishArtifacts = true,
+	EnableGitHubToken = true,
+	ImportSecrets = [nameof(YumaReleaseFeedApiKey), nameof(YumaPreviewFeedApiKey)],
+	WritePermissions = [GitHubActionsPermissions.Contents, GitHubActionsPermissions.Packages])]
+[DotNetVerbosityMapping]
+file class BuildDefinition : NukeBuild
+{
+	public static int Main() => Execute<BuildDefinition>(static x => x.Build);
+
+	[NotNull]
+	Target Build => td => td.DependsOn(MutationTest);
+
+	[NotNull]
+	Target CI => td => td.DependsOn(Push, CreateGitHubRelease)
+		.OnlyWhenStatic(() => IsServerBuild);
+
+	[NotNull]
+	Target Clean => td => td.Executes(() => {
+		ArtifactsDirectory.CreateOrCleanDirectory();
+		DotNetClean(s => s.EnableNoLogo()
+			.SetConfiguration(Configuration)
+			.SetProject(Solution)
+			.SetVerbosity(DotNetVerbosity.minimal));
+	});
+
+	[NotNull]
+	Target AuthenticateGitHubPackageSources => td => td.Unlisted()
+		.OnlyWhenStatic(() => IsServerBuild)
+		.Requires(() => YumaPreviewFeedApiKey)
+		.Executes(() => {
+			var userName = EnvironmentInfo.GetVariable("GITHUB_ACTOR") ?? Environment.UserName ?? "github-actions";
+			var settings = Settings.LoadSpecificSettings(RootDirectory, "NuGet.config");
+			var packageFeed = new PackageSourceProvider(settings).LoadPackageSources()
+				.Single(s => s.Name.Equals("be.stateless.preview", StringComparison.OrdinalIgnoreCase));
+			DotNetNuGetUpdateSource(s => s.SetConfigFile(RootDirectory / "NuGet.config")
+				.SetName(packageFeed.Name)
+				.SetSource(packageFeed.Source)
+				.SetUsername(userName)
+				.SetPassword(YumaPreviewFeedApiKey)
+				.SetStorePasswordInClearText(v: true));
+		});
+
+	[NotNull]
+	Target Restore => td => td.DependsOn(Clean, AuthenticateGitHubPackageSources)
+		.Executes(() => {
+			DotNetRestore(s => s.SetConfigFile(RootDirectory / "NuGet.config")
+				.SetProjectFile(Solution));
+			DotNetToolRestore(s => s.SetToolManifest(RootDirectory / ".config" / "dotnet-tools.json"));
+		});
+
+	[NotNull]
+	Target Compile => td => td.DependsOn(Restore)
+		.Executes(() => {
+			Information("GitVersion.SemVer = {@SemVer}", GitVersion.SemVer);
+			// Debug("GitVersion = {@GitVersion}", GitVersion.ToJson());
+			DotNetBuild(s => s.EnableNoLogo()
+				.EnableNoRestore()
+				.SetConfiguration(Configuration)
+				.SetProjectFile(Solution)
+				.SetAssemblyVersion(GitVersion.AssemblySemVer)
+				.SetFileVersion(GitVersion.AssemblySemFileVer)
+				.SetInformationalVersion(GitVersion.InformationalVersion)
+				.SetVersion(GitVersion.SemVer));
+		});
+
+	[NotNull]
+	Target UnitTest => td => td.Unlisted()
+		.DependsOn(Compile)
+		.Produces(TestCoverageReportsDirectory / "*.html")
+		.Executes(() => {
+			DotNetTest(s => s.EnableNoLogo()
+				.EnableNoBuild()
+				.EnableNoRestore()
+				.SetConfiguration(Configuration)
+				.SetProjectFile(Solution)
+				.SetResultsDirectory(TestResultsDirectory)
+				.SetSettingsFile(RootDirectory / "coverlet.runsettings"));
+			ReportGeneratorTasks.ReportGenerator(s => s.SetTargetDirectory(TestCoverageReportsDirectory)
+				.AddReports(TestResultsDirectory / "**/coverage.cobertura.xml")
+				.AddReportTypes(ReportTypes.lcov, ReportTypes.HtmlInline_AzurePipelines_Dark)
+				.AddFileFilters("-*.g.cs"));
+			string link = TestCoverageReportsDirectory / "index.html";
+			Information($"Code coverage report: \e]8;;file://{link}\e\\{link}\e]8;;\e\\");
+		});
+
+	[NotNull]
+	Target MutationTest => td => td.Unlisted()
+		.DependsOn(UnitTest)
+		.Produces(TestMutationReportsDirectory / "mutation-report.html")
+		.Executes(() => {
+			DotNet(workingDirectory: RootDirectory, arguments: $"stryker --output {ArtifactsDirectory} --solution ./{Solution.FileName}");
+			string link = TestMutationReportsDirectory / "mutation-report.html";
+			Information($"Mutation test report: \e]8;;file://{link}\e\\{link}\e]8;;\e\\");
+		});
+
+	[NotNull]
+	Target Pack => td => td.DependsOn(Compile)
+		.Before(UnitTest) // prevent test instrumentation contaminating packages
+		.Produces(NuGetPackagesDirectory / "*.nupkg")
+		.Executes(() => {
+			DotNetPack(s => s.EnableNoLogo()
+				.EnableNoBuild()
+				.EnableNoRestore()
+				.EnableContinuousIntegrationBuild()
+				.SetConfiguration(Configuration)
+				.SetProject(Solution)
+				.SetNoDependencies(v: true)
+				.SetOutputDirectory(NuGetPackagesDirectory)
+				.SetVersion(GitVersion.SemVer));
+		});
+
+	[NotNull]
+	Target PreviewFeedSetup => td => td.Unlisted()
+		.Description("Set PushApiUrl/PushApiKey for preview NuGet package feed when on feature branch.")
+		.OnlyWhenStatic(() => GitRepository.IsOnFeatureBranch())
+		.Requires(() => YumaPreviewFeedUrl)
+		.Executes(() => {
+			YumaFeedApiKey = GitHubActions.Instance.Token;
+			YumaFeedUrl = YumaPreviewFeedUrl;
+		});
+
+	[NotNull]
+	Target ReleaseFeedSetup => td => td.Unlisted()
+		.Description("Set PushApiUrl/PushApiKey for release NuGet package feed when on feature branch.")
+		.OnlyWhenStatic(() => GitRepository.IsOnMainBranch())
+		.Requires(() => Configuration.Equals(Configuration.Release))
+		.Requires(() => YumaReleaseFeedApiKey)
+		.Requires(() => YumaReleaseFeedUrl)
+		.Executes(() => {
+			YumaFeedApiKey = YumaReleaseFeedApiKey;
+			YumaFeedUrl = YumaReleaseFeedUrl;
+		});
+
+	[NotNull]
+	Target Push => td => td.DependsOn(MutationTest, Pack, PreviewFeedSetup, ReleaseFeedSetup)
+		.OnlyWhenStatic(() => GitRepository.IsOnMainBranch() || GitRepository.IsOnFeatureBranch())
+		.Consumes(Pack)
+		.Executes(() => {
+			YumaFeedApiKey.NotNullOrEmpty();
+			YumaFeedUrl.NotNullOrEmpty();
+			NuGetPackagesDirectory.GlobFiles("*.nupkg")
+				.ForEach(filepath => {
+					Information($"Pushing NuGet package {filepath}");
+					DotNetNuGetPush(s => s.SetSkipDuplicate(GitRepository.IsOnFeatureBranch())
+						.SetApiKey(YumaFeedApiKey)
+						.SetSource(YumaFeedUrl)
+						.SetTargetPath(filepath));
+				});
+		});
+
+	[NotNull]
+	Target CreateGitHubRelease => td => td.DependsOn(Push)
+		.OnlyWhenStatic(() => GitRepository.IsOnMainBranch() || GitRepository.IsOnFeatureBranch())
+		.Executes(async () => {
+			GitHubTasks.GitHubClient.Credentials = new Credentials(GitHubActions.Instance.Token);
+			var release = await GitHubTasks.GitHubClient.Repository.Release.Create(
+				GitRepository.GetGitHubOwner(),
+				GitRepository.GetGitHubName(),
+				new NewRelease($"v{GitVersion.SemVer}") {
+					Name = GitVersion.SemVer,
+					Prerelease = GitRepository.IsOnFeatureBranch(),
+					Draft = false
+				});
+			NuGetPackagesDirectory.GlobFiles("*.nupkg", "*.?nupkg")
+				.Select(async filepath => {
+					await using var assetStream = File.OpenRead(filepath);
+					var asset = new ReleaseAssetUpload {
+						FileName = filepath.Name,
+						ContentType = MediaTypeNames.Application.Octet,
+						RawData = assetStream
+					};
+					await GitHubTasks.GitHubClient.Repository.Release.UploadAsset(release, asset);
+				})
+				.WaitAll();
+		});
+
+	AbsolutePath ArtifactsDirectory => RootDirectory / "artifacts";
+
+	AbsolutePath NuGetPackagesDirectory => ArtifactsDirectory / "nuget-packages";
+
+	AbsolutePath TestCoverageReportsDirectory => ArtifactsDirectory / "test-coverage-reports";
+
+	AbsolutePath TestMutationReportsDirectory => ArtifactsDirectory / "reports";
+
+	AbsolutePath TestResultsDirectory => ArtifactsDirectory / "test-results";
+
+	[Parameter("Configuration to build: 'Debug' or 'Release'.")]
+	readonly Configuration Configuration = IsLocalBuild
+		? Configuration.Debug
+		: Configuration.Release;
+
+	[Required]
+	[GitRepository]
+	readonly GitRepository GitRepository;
+
+	[Required]
+	[GitVersion]
+	readonly GitVersion GitVersion = null!;
+
+	[Parameter("NuGet Packages preview feed API key — a GitHub Personal Access Token (PAT) with read:packages scope.")]
+	[Secret]
+	readonly string YumaPreviewFeedApiKey;
+
+	[Parameter("NuGet packages preview feed URL.")]
+	readonly string YumaPreviewFeedUrl = "https://nuget.pkg.github.com/weareyuma/index.json";
+
+	[Parameter("NuGet Packages release feed API key — a NuGet.org API key used for publishing packages.")]
+	[Secret]
+	readonly string YumaReleaseFeedApiKey;
+
+	[Parameter("NuGet packages release feed URL.")]
+	readonly string YumaReleaseFeedUrl = "https://api.nuget.org/v3/index.json";
+
+	[Secret]
+	string YumaFeedApiKey;
+
+	string YumaFeedUrl;
+
+	[Required]
+	[Solution]
+	[NotNull]
+	readonly Solution Solution = null!;
+}
