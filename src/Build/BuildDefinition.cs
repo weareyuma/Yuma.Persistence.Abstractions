@@ -1,13 +1,13 @@
 #region Copyright & License
 
-// Copyright © 2024 - 2025 Yuma
-//
+// Copyright © 2024-2025 Yuma
+// 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
-//
+// 
 // http://www.apache.org/licenses/LICENSE-2.0
-//
+// 
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -36,7 +36,7 @@ using Octokit;
 using static Nuke.Common.Tools.DotNet.DotNetTasks;
 using static Serilog.Log;
 
-namespace build;
+namespace Build;
 
 [GitHubActions(
 	"ContinuousDelivery",
@@ -77,14 +77,14 @@ file class BuildDefinition : NukeBuild
 		.Executes(() => {
 			var userName = EnvironmentInfo.GetVariable("GITHUB_ACTOR") ?? Environment.UserName ?? "github-actions";
 			var settings = Settings.LoadSpecificSettings(RootDirectory, "NuGet.config");
-			var packageFeed = new PackageSourceProvider(settings).LoadPackageSources()
-				.Single(s => s.Name.Equals("be.stateless.preview", StringComparison.OrdinalIgnoreCase));
-			DotNetNuGetUpdateSource(s => s.SetConfigFile(RootDirectory / "NuGet.config")
-				.SetName(packageFeed.Name)
-				.SetSource(packageFeed.Source)
-				.SetUsername(userName)
-				.SetPassword(YumaPreviewFeedApiKey)
-				.SetStorePasswordInClearText(v: true));
+			new PackageSourceProvider(settings).LoadPackageSources()
+				.Where(ps => ps.Source.Contains("nuget.pkg.github.com", StringComparison.OrdinalIgnoreCase))
+				.ForEach(packageFeed => DotNetNuGetUpdateSource(s => s.SetConfigFile(RootDirectory / "NuGet.config")
+					.SetName(packageFeed.Name)
+					.SetSource(packageFeed.Source)
+					.SetUsername(userName)
+					.SetPassword(YumaPreviewFeedApiKey)
+					.SetStorePasswordInClearText(v: true)));
 		});
 
 	[NotNull]
